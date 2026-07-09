@@ -25,10 +25,12 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
     ) -> None:
+        # 构建 Qwen3 注意力层的并行 QKV/O 投影、RoPE 和可选 Q/K RMSNorm。
         super().__init__()
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
+        # 注意力头按 tensor parallel rank 切分，每个 rank 只计算自己的 head 子集。
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
@@ -74,6 +76,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 计算当前 rank 的 Q/K/V，应用 RoPE 和 flash-attn，再通过 O 投影回 hidden size。
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -96,6 +99,7 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
     ) -> None:
+        # 构建 Qwen3 的 gated MLP：合并 gate/up 投影、SwiGLU 激活和 down 投影。
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -111,6 +115,7 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # 执行 Qwen3 MLP 的 gate/up、激活和降维投影。
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
@@ -123,6 +128,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
     ) -> None:
+        # 组装一个 decoder block：self-attention、MLP 以及两处 RMSNorm。
         super().__init__()
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -149,6 +155,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # RMSNorm 返回归一化后的 hidden_states 和累积 residual，匹配 vLLM 常见的 fused residual 模式。
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -165,6 +172,7 @@ class Qwen3Model(nn.Module):
         self,
         config: Qwen3Config,
     ) -> None:
+        # 构建 token embedding、所有 decoder layer 和最终 RMSNorm。
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
@@ -175,6 +183,7 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # 从 token id 得到 hidden states，依次通过所有 decoder layer。
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
@@ -184,6 +193,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # HuggingFace 权重名到本项目合并/并行层的映射，loader 会依赖它把权重切片装入对应参数。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -196,6 +206,7 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         config: Qwen3Config
     ) -> None:
+        # 包装 Qwen3 backbone 和并行 LM head，必要时共享 embedding 权重。
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
@@ -207,10 +218,12 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # 返回 backbone 的最后 hidden states。
         return self.model(input_ids, positions)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 将 hidden states 投影到词表维度，得到采样所需 logits。
         return self.lm_head(hidden_states)

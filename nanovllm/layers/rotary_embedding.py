@@ -8,6 +8,7 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
+    # 对 query/key 的偶奇半维执行旋转位置编码。
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
@@ -23,6 +24,7 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int,
         base: float,
     ) -> None:
+        # 预计算所有位置的 cos/sin cache，前向时按 positions 直接索引。
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
@@ -41,6 +43,7 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 取出当前位置的 RoPE cache，并同时旋转 query 和 key。
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         query = apply_rotary_emb(query, cos, sin)
@@ -55,5 +58,6 @@ def get_rope(
     max_position: int,
     base: float,
 ):
+    # 复用同一组 RoPE 配置的 RotaryEmbedding，避免重复构建 cos/sin cache。
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

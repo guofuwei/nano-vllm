@@ -6,6 +6,7 @@ from nanovllm import LLM, SamplingParams
 
 
 def main():
+    # 构造一批随机 token prompt，测量 nano-vLLM 在固定模型上的生成吞吐。
     seed(0)
     num_seqs = 256
     max_input_len = 1024

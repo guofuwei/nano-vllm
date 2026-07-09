@@ -13,6 +13,7 @@ class VocabParallelEmbedding(nn.Module):
         num_embeddings: int,
         embedding_dim: int,
     ):
+        # 将词表按 tensor-parallel rank 均分，每个 rank 只保存自己的 embedding 切片。
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -25,6 +26,7 @@ class VocabParallelEmbedding(nn.Module):
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # 从完整 embedding 权重中加载当前 rank 对应的词表区间。
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
@@ -32,6 +34,7 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        # 查当前 rank 的局部词表；多 rank 时通过 mask 和 all-reduce 合成完整 embedding。
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
@@ -50,10 +53,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         embedding_dim: int,
         bias: bool = False,
     ):
+        # LM head 复用词表并行 embedding 的权重布局，且当前实现不支持 bias。
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        # 只对每条 prefill 序列的最后一个 token 或 decode token 计算 logits。
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1

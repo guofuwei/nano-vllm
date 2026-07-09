@@ -18,6 +18,7 @@ def store_kvcache_kernel(
     slot_mapping_ptr,
     D: tl.constexpr,
 ):
+    # Triton kernel：把当前 batch 的 K/V 向量写入扁平化的分页 KV cache 位置。
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return
@@ -31,6 +32,7 @@ def store_kvcache_kernel(
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    # 校验张量布局后启动 Triton kernel，将新产生的 K/V 存入 cache。
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
@@ -49,6 +51,7 @@ class Attention(nn.Module):
         scale,
         num_kv_heads,
     ):
+        # 保存 attention 的 head 配置；实际 KV cache 会在 ModelRunner 分配后注入。
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -57,12 +60,15 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # 根据全局 context 在 prefill/decode 两种路径下调用 flash-attn。
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
+            # prefill/decode 都会先把本轮新产生的 K/V 写入分页 KV cache。
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
+                # prefix cache 命中时，注意力读取完整 cache，而不是只读取本轮新 token 的 k/v。
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
